@@ -3,7 +3,7 @@ import { STLLoader } from 'three/addons/loaders/STLLoader.js';
 import { OBJLoader } from 'three/addons/loaders/OBJLoader.js';
 import { STLExporter } from 'three/addons/exporters/STLExporter.js';
 
-export const MAX_TRIANGLES = 200000;
+export const MAX_TRIANGLES = 500000;
 export function positions(geometry) {
   const g = geometry.index ? geometry.toNonIndexed() : geometry;
   const result = new Float32Array(g.attributes.position.array);
@@ -12,7 +12,7 @@ export function positions(geometry) {
 }
 export function validateParts(parts) {
   const count = parts.reduce((n, p) => n + p.length / 9, 0);
-  if (!count || count > MAX_TRIANGLES) throw new Error('請使用 1–200,000 個三角面的模型。');
+  if (!count || count > MAX_TRIANGLES) throw new Error('請使用 1–500,000 個三角面的模型。');
   for (const p of parts) if (p.length % 9 || !p.every(Number.isFinite)) throw new Error('模型含有無效座標或不完整三角面。');
   const box = bounds(parts);
   if (box.getSize(new THREE.Vector3()).length() < 1e-8) throw new Error('模型尺寸為零。');

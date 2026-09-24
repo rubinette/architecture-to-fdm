@@ -51,7 +51,8 @@ export function repairSolid(module, source, config, keep) {
 
 export function buildSupports(module, solid, analysis, config, keep) {
   const spacing = config.supportSpacing ?? 3, gap = config.supportGap ?? .2, diameter = config.supportDiameter ?? 1.6;
-  if (!Number.isFinite(spacing) || spacing < 1 || spacing > 8 || !Number.isFinite(gap) || gap < .05 || gap > .5 || !Number.isFinite(diameter) || diameter < .8 || diameter > 4) throw new Error('支撐間距需 1–8 mm，接觸間隙需 0.05–0.5 mm，柱徑需 0.8–4 mm。');
+  const minGap = config.multiMaterial === true ? 0 : .05;
+  if (!Number.isFinite(spacing) || spacing < 1 || spacing > 8 || !Number.isFinite(gap) || gap < minGap || gap > .5 || !Number.isFinite(diameter) || diameter < .8 || diameter > 4) throw new Error(`支撐間距需 1–8 mm，接觸間隙需 ${minGap}–0.5 mm，柱徑需 0.8–4 mm。`);
   const p = solidPositions(solid), geometry = new BufferGeometry();
   geometry.setAttribute('position', new BufferAttribute(p, 3));
   const bvh = new MeshBVH(geometry, { indirect: true });
