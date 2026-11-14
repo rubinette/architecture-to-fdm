@@ -5,7 +5,7 @@ export function analyzePrintability(positions, { minWall = .8, overhangAngle = 4
   if (!Number.isFinite(minWall) || minWall < .1 || minWall > 20 || !Number.isFinite(overhangAngle) || overhangAngle < 5 || overhangAngle > 85) throw new Error('壁厚需介於 0.1–20 mm，懸垂角度需介於 5–85°。');
   const geometry = new BufferGeometry();
   geometry.setAttribute('position', new BufferAttribute(positions, 3));
-  const bvh = new MeshBVH(geometry, { indirect: true });
+  const bvh = new MeshBVH(geometry, { indirect: true, maxDepth: 80 });
   const a = new Vector3(), b = new Vector3(), c = new Vector3(), ab = new Vector3(), ac = new Vector3(), normal = new Vector3(), center = new Vector3();
   const ray = new Ray(), overhangFaces = [], thinFaces = [];
   let overhangArea = 0, samples = 0, measured = 0, thinCount = 0, minThickness = Infinity;

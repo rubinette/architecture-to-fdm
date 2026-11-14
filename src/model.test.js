@@ -234,7 +234,7 @@ test('approximate reconstruction is opt-in, closes branched sheets and survives 
   assert.ok(Math.abs(reimported.volume - r.volume) < r.volume * 1e-5);
 });
 
-test('reconstruction fills cracked, partly inverted shells and keeps sub-grid closed shells exact', () => {
+test('reconstruction fills cracked, partly inverted shells without moving their faces', () => {
   const cube = box(20, 20, 20);
   for (let i = 37; i < 54; i += 3) cube[i] += .3; // Lift the top face: a 0.3 mm crack on every top edge.
   cube.set(cube.slice(60, 63), 57); cube.set(box(20, 20, 20).slice(57, 60), 60); // Reverse one side triangle.
@@ -242,12 +242,13 @@ test('reconstruction fills cracked, partly inverted shells and keeps sub-grid cl
   assert.throws(() => run([soup], { maxHoleSize: 0 }), /近似重建/);
   const r = run([soup], { maxHoleSize: 0, reconstruct: true });
   assert.equal(r.meshRepair.reconstructed, true);
-  assert.equal(r.meshRepair.closedShells, 1);
+  assert.equal(r.meshRepair.cells, 1); // The tiny closed box; the cracked cube encloses no cell.
   assert.ok(r.meshRepair.enclosedFraction > 0);
-  const outer = 20 + 2 * r.meshRepair.step;
-  assert.ok(r.volume > 20 ** 3 * .95 && r.volume < outer ** 3 + 1, `volume ${r.volume}`); // Solid, not a hollow skin.
+  assert.ok(Math.abs(r.volume - (20 * 20 * 20.3 + .2 ** 3)) < 20, `volume ${r.volume}`); // Solid, not a hollow skin.
   const b = bounds([r.positions]);
-  assert.ok(Math.abs(b.max.x - 12.55) < 1e-4, `max x ${b.max.x}`); // Centered tiny box face, not inflated by the grid.
+  // Original faces stay where they were: the cube side and the tiny box face, centred together.
+  assert.ok(Math.abs(b.max.x - 12.55) < 1e-4 && Math.abs(b.min.x + 12.55) < 1e-4, `x ${b.min.x}..${b.max.x}`);
+  assert.ok(Math.abs(b.max.y - 20.6) < 1e-4, `max y ${b.max.y}`);
 });
 test('reconstruction seal width decides whether a wide opening stays hollow', () => {
   const cube = box(20, 20, 20);
@@ -271,6 +272,7 @@ test('local test.stl imports, reconstructs and reimports without repair', { skip
   assert.ok(stl.byteLength < 25 * 1024 * 1024);
   const verified = run(parseModel(stl.buffer, 'stl'), { meshRepair: false });
   assert.equal(verified.meshRepair, null);
-  assert.ok(Math.abs(verified.volume - r.volume) < r.volume * 1e-5);
+  // Parts that only touch along an edge are paired differently when the STL is welded again.
+  assert.ok(Math.abs(verified.volume - r.volume) < r.volume * .01, `volume ${r.volume} reimported ${verified.volume}`);
   assert.deepEqual(readFileSync(realSTL), bytes);
 });

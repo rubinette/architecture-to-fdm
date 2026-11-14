@@ -106,7 +106,7 @@ function showChecks(error = checkError) {
   $('reconstruct').disabled = $('weld-tolerance').disabled = $('max-hole-size').disabled = !$('mesh-repair').checked;
   if (result?.meshRepair) {
     const r = result.meshRepair;
-    $('mesh-repair-summary').textContent = r.reconstructed ? `已近似重建：網格間距 ${r.step.toFixed(3)} mm，表面向外擴張約 ${r.radius.toFixed(3)} mm，封住 ${(r.seal * 2).toFixed(2)} mm 以下的開口，簡化誤差上限 ${r.simplification.toFixed(3)} mm；原樣保留 ${r.closedShells} 個細小封閉零件。細節及尺寸已改變，較寬開口後方的空間仍為中空。請切換「修正前」比較，並檢查切片。原修復失敗原因：${r.reason}` : `已修復 ${r.repairedParts} 個網格分組：清除 ${r.removedFaces} 個重複／退化面、校正 ${r.flippedFaces} 個面向、補上 ${r.filledHoles} 個平面開口、分離 ${r.splitEdges} 條非流形共用邊。修復後已通過實體建構檢查；可切換「修正前」比較。`;
+    $('mesh-repair-summary').textContent = r.reconstructed ? `已重建並保留原始表面：${r.cells} 個封閉零件原樣保留，其餘 ${r.skinFaces} 個面向內加厚（最深 ${r.depth.toFixed(2)} mm，兩側皆露出的單片面加厚為壁厚警戒值）。判定內外的格距 ${r.step.toFixed(3)} mm，${(r.seal * 2).toFixed(2)} mm 以下的開口視為封閉，其後方空間填實；較寬開口後方仍為中空。簡化誤差上限 ${r.simplification.toFixed(3)} mm。請切換「修正前」比較，並檢查切片。原修復失敗原因：${r.reason}` : `已修復 ${r.repairedParts} 個網格分組：清除 ${r.removedFaces} 個重複／退化面、校正 ${r.flippedFaces} 個面向、補上 ${r.filledHoles} 個平面開口、分離 ${r.splitEdges} 條非流形共用邊。修復後已通過實體建構檢查；可切換「修正前」比較。`;
   }
   if (result?.changes) $('repair-summary').textContent = result.changes.notes.join(' ');
   const dual = $('multi-material').checked;

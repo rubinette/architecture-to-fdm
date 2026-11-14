@@ -179,153 +179,424 @@ function triangleDistanceSq(px, py, pz, t, o) {
   return dx * dx + dy * dy + dz * dz;
 }
 
-// Closed, consistently oriented shells thinner than `thinBelow` (mullions, railings, panes) are
-// below grid resolution; they are kept exactly instead of being blurred by the distance field.
-function thinClosedShells(module, p, weldTolerance, thinBelow, keep) {
-  const ids = new Map(), vertex = new Int32Array(p.length / 3);
-  for (let i = 0; i < vertex.length; i++) {
-    const key = `${Math.round(p[i * 3] / weldTolerance)},${Math.round(p[i * 3 + 1] / weldTolerance)},${Math.round(p[i * 3 + 2] / weldTolerance)}`;
-    if (!ids.has(key)) ids.set(key, ids.size);
-    vertex[i] = ids.get(key);
-  }
-  const parent = Int32Array.from({ length: ids.size }, (_, i) => i);
-  const find = x => { while (parent[x] !== x) x = parent[x] = parent[parent[x]]; return x; };
-  for (let i = 0; i < vertex.length; i += 3) { parent[find(vertex[i + 1])] = find(vertex[i]); parent[find(vertex[i + 2])] = find(vertex[i]); }
-  const groups = new Map();
-  for (let f = 0; f < vertex.length / 3; f++) {
-    const root = find(vertex[f * 3]);
-    if (!groups.has(root)) groups.set(root, []);
-    groups.get(root).push(f);
-  }
-  const shells = [], thinFace = new Uint8Array(vertex.length / 3);
-  for (const faces of groups.values()) {
-    const lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
-    for (const f of faces) for (let i = f * 9; i < f * 9 + 9; i++) { const k = i % 3; lo[k] = Math.min(lo[k], p[i]); hi[k] = Math.max(hi[k], p[i]); }
-    if (Math.min(...hi.map((h, k) => h - lo[k])) >= thinBelow) continue;
-    const half = new Set(); let closed = true;
-    for (const f of faces) for (let k = 0; k < 3 && closed; k++) {
-      const a = vertex[f * 3 + k], b = vertex[f * 3 + (k + 1) % 3], key = `${a},${b}`;
-      if (a === b || half.has(key)) closed = false; else half.add(key);
+// Exact solids for the cells that welded faces enclose. Around each edge the faces are sorted by
+// angle, and the two face sides bounding the wedge between neighbours lie on the same cell, so
+// connected face sides are one cell's boundary. A cell with positive volume is bounded and becomes
+// a solid, however its faces were wound and however many faces meet along its edges.
+function cellSolids(module, p, vertex, normal, vertexCount, keep) {
+  const F = vertex.length / 3, seen = new Set(), edges = new Map();
+  for (let f = 0; f < F; f++) {
+    const v = [vertex[f * 3], vertex[f * 3 + 1], vertex[f * 3 + 2]], key = [...v].sort((x, y) => x - y).join(',');
+    if ((!normal[f * 3] && !normal[f * 3 + 1] && !normal[f * 3 + 2]) || seen.has(key)) continue;
+    seen.add(key);
+    for (let k = 0; k < 3; k++) {
+      const a = v[k], b = v[(k + 1) % 3], e = a < b ? a * vertexCount + b : b * vertexCount + a;
+      let list = edges.get(e);
+      if (!list) edges.set(e, list = []);
+      list.push(f * 3 + k);
     }
-    if (!closed) continue;
-    for (const key of half) { const [a, b] = key.split(','); if (!half.has(`${b},${a}`)) { closed = false; break; } }
-    if (!closed) continue;
-    const triVerts = new Uint32Array(faces.length * 3), local = new Map(), props = [];
-    faces.forEach((f, i) => { for (let k = 0; k < 3; k++) {
-      const v = vertex[f * 3 + k];
-      if (!local.has(v)) { local.set(v, local.size); props.push(p[f * 9 + k * 3], p[f * 9 + k * 3 + 1], p[f * 9 + k * 3 + 2]); }
-      triVerts[i * 3 + k] = local.get(v);
-    } });
-    let m;
-    try { m = keep(new module.Manifold(new module.Mesh({ numProp: 3, vertProperties: new Float32Array(props), triVerts }))); }
-    catch (error) { if (error.code === 'NotManifold') continue; throw error; }
-    if (m.volume() < 0) { // Inverted shell: reverse winding.
-      for (let i = 0; i < triVerts.length; i += 3) [triVerts[i + 1], triVerts[i + 2]] = [triVerts[i + 2], triVerts[i + 1]];
-      m = keep(new module.Manifold(new module.Mesh({ numProp: 3, vertProperties: new Float32Array(props), triVerts })));
-    }
-    if (!(m.volume() > 0)) continue;
-    shells.push(m);
-    for (const f of faces) thinFace[f] = 1;
   }
-  return { shells, thinFace };
+  // Per edge, entries f * 8 + k * 2 + up in angular order; `up` is the face side (0 front, 1 back)
+  // that looks towards increasing angle.
+  const side = new Int32Array(F * 2).map((_, i) => i), find = (set, x) => { while (set[x] !== x) x = set[x] = set[set[x]]; return x; };
+  const rings = [];
+  for (const list of edges.values()) {
+    const f0 = list[0] / 3 | 0, k0 = list[0] % 3, u0 = vertex[f0 * 3 + k0], v0 = vertex[f0 * 3 + (k0 + 1) % 3], low = u0 < v0 ? k0 : (k0 + 1) % 3, high = u0 < v0 ? (k0 + 1) % 3 : k0;
+    const a = f0 * 9 + low * 3, ex = p[f0 * 9 + high * 3] - p[a], ey = p[f0 * 9 + high * 3 + 1] - p[a + 1], ez = p[f0 * 9 + high * 3 + 2] - p[a + 2];
+    let ux = 0, uy = 0, uz = 0, vx = 0, vy = 0, vz = 0;
+    const ring = list.map((entry, i) => {
+      const f = entry / 3 | 0, k = entry % 3, w = f * 9 + (k + 2) % 3 * 3, wx = p[w] - p[a], wy = p[w + 1] - p[a + 1], wz = p[w + 2] - p[a + 2];
+      const along = (wx * ex + wy * ey + wz * ez) / (ex * ex + ey * ey + ez * ez), rx = wx - ex * along, ry = wy - ey * along, rz = wz - ez * along;
+      const tx = ey * rz - ez * ry, ty = ez * rx - ex * rz, tz = ex * ry - ey * rx; // Direction of increasing angle at this face.
+      if (!i) { ux = rx; uy = ry; uz = rz; vx = tx; vy = ty; vz = tz; }
+      const up = tx * normal[f * 3] + ty * normal[f * 3 + 1] + tz * normal[f * 3 + 2] > 0 ? 0 : 1;
+      return { code: f * 8 + k * 2 + up, angle: i ? Math.atan2((rx * vx + ry * vy + rz * vz) / Math.hypot(vx, vy, vz), (rx * ux + ry * uy + rz * uz) / Math.hypot(ux, uy, uz)) : 0 };
+    });
+    if (ring.length > 2) ring.sort((x, y) => x.angle - y.angle);
+    const codes = ring.map(r => r.code);
+    rings.push(codes);
+    codes.forEach((code, i) => {
+      const next = codes[(i + 1) % codes.length];
+      side[find(side, (next >> 3) * 2 + 1 - (next & 1))] = find(side, (code >> 3) * 2 + (code & 1));
+    });
+  }
+  // Signed volume with normals pointing out of the cell: positive for bounded cells.
+  const volume = new Float64Array(F * 2), members = new Map();
+  for (const f of new Set(rings.flatMap(codes => codes.map(code => code >> 3)))) {
+    const t = f * 9, bx = p[t + 3] - p[t], by = p[t + 4] - p[t + 1], bz = p[t + 5] - p[t + 2], cx = p[t + 6] - p[t], cy = p[t + 7] - p[t + 1], cz = p[t + 8] - p[t + 2];
+    const det = (p[t] - p[0]) * (by * cz - bz * cy) + (p[t + 1] - p[1]) * (bz * cx - bx * cz) + (p[t + 2] - p[2]) * (bx * cy - by * cx);
+    const front = find(side, f * 2), back = find(side, f * 2 + 1);
+    if (front === back) continue; // Both sides in one cell: a flap or buried sheet, not a boundary.
+    volume[front] -= det / 6; volume[back] += det / 6;
+    for (const h of [f * 2, f * 2 + 1]) { const r = h & 1 ? back : front; if (!members.has(r)) members.set(r, []); members.get(r).push(h); }
+  }
+  const bounded = h => { const r = find(side, h); return volume[r] > 1e-9 && find(side, h ^ 1) !== r; };
+  // Mesh corners: joined across each edge with the neighbour that bounds the same wedge of the cell,
+  // so a cell touching itself along an edge or at a vertex still gets a 2-manifold mesh.
+  const corner = new Int32Array(F * 6).map((_, i) => i), bad = new Set();
+  const at = (f, id) => vertex[f * 3] === id ? 0 : vertex[f * 3 + 1] === id ? 1 : 2;
+  for (const codes of rings) {
+    const f0 = codes[0] >> 3, k0 = codes[0] >> 1 & 3, a = vertex[f0 * 3 + k0], b = vertex[f0 * 3 + (k0 + 1) % 3], events = [];
+    for (const code of codes) { // Going round the edge, each face shows its backward-looking side first.
+      const f = code >> 3, up = code & 1;
+      if (bounded(f * 2 + 1 - up)) events.push((f * 2 + 1 - up) * 2);
+      if (bounded(f * 2 + up)) events.push((f * 2 + up) * 2 + 1);
+    }
+    events.forEach((event, i) => {
+      if (!(event & 1)) return;
+      const h = event >> 1, r = find(side, h);
+      for (let step = 1; step <= events.length; step++) {
+        const other = events[(i + step) % events.length], g = other >> 1;
+        if (find(side, g) !== r) continue;
+        if (other & 1 || g === h) bad.add(r);
+        else for (const id of [a, b]) corner[find(corner, g * 3 + at(g >> 1, id))] = find(corner, h * 3 + at(h >> 1, id));
+        return;
+      }
+    });
+  }
+  const solids = [], good = new Set();
+  for (const [r, halves] of members) {
+    if (!(volume[r] > 1e-9) || bad.has(r)) continue;
+    const local = new Map(), vertProperties = [], triVerts = [];
+    for (const h of halves) {
+      const f = h >> 1, v = [0, 1, 2].map(k => {
+        const id = find(corner, h * 3 + k);
+        if (!local.has(id)) { local.set(id, local.size); vertProperties.push(p[f * 9 + k * 3], p[f * 9 + k * 3 + 1], p[f * 9 + k * 3 + 2]); }
+        return local.get(id);
+      });
+      if (h & 1) triVerts.push(v[0], v[1], v[2]); else triVerts.push(v[0], v[2], v[1]);
+    }
+    try {
+      const m = keep(new module.Manifold(new module.Mesh({ numProp: 3, vertProperties: Float32Array.from(vertProperties), triVerts: Uint32Array.from(triVerts) })));
+      if (!(m.volume() > 0)) continue;
+      solids.push(m);
+    } catch (error) { if (error.code !== 'NotManifold') throw error; continue; }
+    good.add(r);
+  }
+  // Face sides (f * 2 front, f * 2 + 1 back) that look into a solid cell, sheets inside one included.
+  const inCell = new Uint8Array(F * 2);
+  for (const codes of rings) for (const code of codes) for (const h of [(code >> 3) * 2, (code >> 3) * 2 + 1]) if (good.has(find(side, h))) inCell[h] = 1;
+  return { solids, inCell };
 }
 
-// Approximate rescue for SketchUp-style triangle soups (open seams, branched edges, inverted or
-// zero-thickness faces). Inside/outside comes from flood-filling the exterior on a grid, so face
-// orientation and topology are ignored; the distance to the nearest triangle gives the surface
-// sub-grid position. Openings narrower than `sealGap` (at least about two grid steps) are closed
-// morphologically; wider ones let the exterior in and those spaces stay hollow.
+// Union of many solids. Small neighbours in space are merged first, level by level, so each
+// boolean only meets the few solids around it; solids spanning much of the model join at the end.
+function unionNearby(module, solids, keep) {
+  const boxes = solids.map(m => m.boundingBox()), lo = [0, 1, 2].map(k => boxes.reduce((v, b) => Math.min(v, b.min[k]), Infinity));
+  const size = Math.max(1e-9, ...[0, 1, 2].map(k => boxes.reduce((v, b) => Math.max(v, b.max[k]), -Infinity) - lo[k]));
+  const spread = v => { v = (v | v << 16) & 0x030000ff; v = (v | v << 8) & 0x0300f00f; v = (v | v << 4) & 0x030c30c3; return (v | v << 2) & 0x09249249; };
+  const code = boxes.map(b => { const [x, y, z] = [0, 1, 2].map(k => Math.min(1023, ((b.min[k] + b.max[k]) / 2 - lo[k]) / size * 1024 | 0)); return spread(x) | spread(y) << 1 | spread(z) << 2; });
+  const large = [], small = [];
+  boxes.forEach((b, i) => (Math.max(b.max[0] - b.min[0], b.max[1] - b.min[1], b.max[2] - b.min[2]) > size / 8 ? large : small).push(i));
+  let level = small.sort((a, b) => code[a] - code[b]).map(i => solids[i]);
+  while (level.length > 1) {
+    const next = [];
+    for (let i = 0; i < level.length; i += 4) {
+      const group = level.slice(i, i + 4), m = group.length > 1 ? keep(module.Manifold.union(group)) : group[0];
+      m.numTri(); // Evaluate now; a deferred union would flatten the tree back into one pass.
+      next.push(m);
+    }
+    level = next;
+  }
+  const rest = [...level, ...large.map(i => solids[i])];
+  return rest.length > 1 ? keep(module.Manifold.union(rest)) : rest[0];
+}
+
+// Fills sealed voids: drops inward-facing shells, anything floating inside them, and specks
+// below 0.001 mm³. Returns null when there is nothing to drop.
+function fillVoids(module, solid) {
+  const mesh = solid.getMesh(), tri = mesh.triVerts, np = mesh.numProp, vp = mesh.vertProperties;
+  const parent = Int32Array.from({ length: vp.length / np }, (_, i) => i), find = x => { while (parent[x] !== x) x = parent[x] = parent[parent[x]]; return x; };
+  for (let i = 0; i < tri.length; i += 3) { parent[find(tri[i + 1])] = find(tri[i]); parent[find(tri[i + 2])] = find(tri[i]); }
+  const shells = new Map(), at = (i, k) => vp[tri[i] * np + k];
+  for (let i = 0; i < tri.length; i += 3) {
+    const r = find(tri[i]);
+    let shell = shells.get(r);
+    if (!shell) shells.set(r, shell = { volume: 0, min: [Infinity, Infinity, Infinity], max: [-Infinity, -Infinity, -Infinity], faces: [] });
+    const a = [0, 1, 2].map(k => at(i, k)), b = [0, 1, 2].map(k => at(i + 1, k)), c = [0, 1, 2].map(k => at(i + 2, k));
+    shell.volume += (a[0] * (b[1] * c[2] - b[2] * c[1]) - a[1] * (b[0] * c[2] - b[2] * c[0]) + a[2] * (b[0] * c[1] - b[1] * c[0])) / 6;
+    for (const v of [a, b, c]) for (let k = 0; k < 3; k++) { if (v[k] < shell.min[k]) shell.min[k] = v[k]; if (v[k] > shell.max[k]) shell.max[k] = v[k]; }
+    shell.faces.push(i);
+  }
+  const all = [...shells.values()], voids = all.filter(s => s.volume < -1e-3), drop = new Set(all.filter(s => !(s.volume > 1e-3)));
+  // A solid shell lies in a void when a point on it is inside the void's wall: odd crossings on most of three rays.
+  const directions = [[.5131, .3714, .7738], [-.6421, .7003, .3118], [.2672, -.5345, .8018]].map(d => new Vector3(...d).normalize());
+  for (const wall of voids) {
+    const inside = all.filter(s => s.volume > 1e-3 && !drop.has(s) && s.min.every((v, k) => v >= wall.min[k]) && s.max.every((v, k) => v <= wall.max[k]));
+    if (!inside.length) continue;
+    const positions = new Float32Array(wall.faces.length * 9);
+    wall.faces.forEach((i, f) => { for (let c = 0; c < 3; c++) for (let k = 0; k < 3; k++) positions[f * 9 + c * 3 + k] = at(i + c, k); });
+    const geometry = new BufferGeometry().setAttribute('position', new BufferAttribute(positions, 3));
+    try {
+      const bvh = new MeshBVH(geometry, { maxDepth: 80, verbose: false }), ray = new Ray();
+      for (const shell of inside) {
+        const i = shell.faces[0];
+        ray.origin.set((at(i, 0) + at(i + 1, 0) + at(i + 2, 0)) / 3, (at(i, 1) + at(i + 1, 1) + at(i + 2, 1)) / 3, (at(i, 2) + at(i + 1, 2) + at(i + 2, 2)) / 3);
+        let odd = 0;
+        for (const direction of directions) {
+          ray.direction.copy(direction);
+          const hits = bvh.raycast(ray, DoubleSide).map(h => h.distance).sort((a, b) => a - b);
+          odd += hits.filter((d, n) => !n || d - hits[n - 1] > 1e-6).length % 2;
+        }
+        if (odd > 1) drop.add(shell);
+      }
+    } finally { geometry.dispose(); }
+  }
+  if (!drop.size) return null;
+  const kept = [];
+  for (const shell of all) if (!drop.has(shell)) for (const i of shell.faces) kept.push(tri[i], tri[i + 1], tri[i + 2]);
+  return new module.Manifold(new module.Mesh({ numProp: np, vertProperties: vp, triVerts: Uint32Array.from(kept) }));
+}
+
+// Rescue for SketchUp-style triangle soups (open seams, branched edges, inverted or zero-thickness
+// faces) that keeps the original faces as the visible surface:
+// 1. Every cell the welded faces enclose becomes an exact solid (`cellSolids`).
+// 2. A grid flood from outside decides which side of every remaining face is exterior. Openings
+//    narrower than `sealGap` (at least two grid steps) stop it, so cracks do not let it into the
+//    room behind.
+// 3. Faces between the exterior and enclosed space are extruded inward, free-standing sheets become
+//    slabs centred on the face, and enclosed space is filled by a coarse grid core that stays
+//    behind every face, so grid surface only shows where it closes an opening.
 export function reconstructMesh(module, parts, { minWall = .8, weldTolerance = .001, sealGap = 0 } = {}) {
   if (!Number.isFinite(minWall) || minWall < .1 || minWall > 20) throw failure('壁厚需介於 0.1–20 mm。');
   if (!Number.isFinite(sealGap) || sealGap < 0 || sealGap > 20) throw new RangeError('封閉開口寬度需為 0–20 mm。');
   const p = new Float64Array(parts.reduce((n, part) => n + part.length, 0));
   let offset = 0;
   for (const part of parts) { p.set(part, offset); offset += part.length; }
-  const lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
+  const F = p.length / 9, lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
   for (let i = 0; i < p.length; i++) { const k = i % 3; if (p[i] < lo[k]) lo[k] = p[i]; if (p[i] > hi[k]) hi[k] = p[i]; }
   // Distances are tracked within `band`; two extra nodes of padding keep the grid border exterior.
   const bandFor = h => Math.max(h * 2, Math.max(h, sealGap / 2) + h), padFor = h => Math.ceil(bandFor(h) / h) + 2;
   const dimsFor = h => lo.map((l, k) => Math.ceil((hi[k] - l) / h) + 1 + padFor(h) * 2);
   let step = minWall / 2;
   while (dimsFor(step).reduce((a, b) => a * b) > MAX_NODES) step *= 1.05;
-  const radius = step * .75, seal = Math.max(step, sealGap / 2), band = bandFor(step);
-  const [nx, ny, nz] = dimsFor(step), nxy = nx * ny, n = nxy * nz, origin = lo.map(l => l - step * padFor(step));
+  const depth = Math.max(minWall, step * 4), seal = Math.max(step, sealGap / 2), band = bandFor(step);
+  const dims = dimsFor(step), [nx, ny, nz] = dims, nxy = nx * ny, n = nxy * nz, origin = lo.map(l => l - step * padFor(step));
   const keep = [], owned = m => { keep.push(m); return m; };
   try {
-    const { shells, thinFace } = thinClosedShells(module, p, weldTolerance, step * 2, owned);
-    // Unsigned distance within the band, quantized to 254 levels; 255 = farther than the band.
-    // Node state: 0 unknown, 1 exterior, 2 exterior after un-sealing, 3 blocked by a thin exact shell.
+    // Unit normals (zero for faces that are degenerate, also after welding) and welded vertex ids.
+    const normal = new Float64Array(F * 3), vertex = new Int32Array(F * 3), ids = new Map(), first = [];
+    for (let f = 0; f < F; f++) {
+      const t = f * 9, ex1 = p[t + 3] - p[t], ey1 = p[t + 4] - p[t + 1], ez1 = p[t + 5] - p[t + 2], ex2 = p[t + 6] - p[t], ey2 = p[t + 7] - p[t + 1], ez2 = p[t + 8] - p[t + 2];
+      const cx = ey1 * ez2 - ez1 * ey2, cy = ez1 * ex2 - ex1 * ez2, cz = ex1 * ey2 - ey1 * ex2, length = Math.hypot(cx, cy, cz);
+      if (length > weldTolerance ** 2) { normal[f * 3] = cx / length; normal[f * 3 + 1] = cy / length; normal[f * 3 + 2] = cz / length; }
+      for (let k = 0; k < 3; k++) {
+        const i = t + k * 3, key = `${Math.round(p[i] / weldTolerance)},${Math.round(p[i + 1] / weldTolerance)},${Math.round(p[i + 2] / weldTolerance)}`;
+        let id = ids.get(key);
+        if (id === undefined) { ids.set(key, id = first.length); first.push(i); }
+        vertex[f * 3 + k] = id;
+      }
+      if (vertex[f * 3] === vertex[f * 3 + 1] || vertex[f * 3 + 1] === vertex[f * 3 + 2] || vertex[f * 3] === vertex[f * 3 + 2]) normal[f * 3] = normal[f * 3 + 1] = normal[f * 3 + 2] = 0;
+    }
+    const flat = f => !normal[f * 3] && !normal[f * 3 + 1] && !normal[f * 3 + 2];
+    // 1. Exact solids for every cell the welded faces enclose.
+    const { solids, inCell } = cellSolids(module, p, vertex, normal, first.length, owned), cells = solids.length;
+    // 2. Unsigned distance within the band, quantized to 254 levels; 255 = farther than the band.
     const dist = new Uint8Array(n).fill(255), qScale = 254 / band, state = new Uint8Array(n);
-    for (let t = 0; t < p.length; t += 9) {
-      const thin = thinFace[t / 9], reach = thin ? seal : band;
-      const ex1 = p[t + 3] - p[t], ey1 = p[t + 4] - p[t + 1], ez1 = p[t + 5] - p[t + 2], ex2 = p[t + 6] - p[t], ey2 = p[t + 7] - p[t + 1], ez2 = p[t + 8] - p[t + 2];
-      let cx = ey1 * ez2 - ez1 * ey2, cy = ez1 * ex2 - ex1 * ez2, cz = ex1 * ey2 - ey1 * ex2;
-      const area = Math.hypot(cx, cy, cz); if (area > 0) { cx /= area; cy /= area; cz /= area; }
-      const range = k => {
+    const nodes = (f, reach, visit) => {
+      const t = f * 9, range = k => {
         const a = Math.min(p[t + k], p[t + 3 + k], p[t + 6 + k]), b = Math.max(p[t + k], p[t + 3 + k], p[t + 6 + k]);
-        return [Math.max(0, Math.floor((a - reach - origin[k]) / step)), Math.min([nx, ny, nz][k] - 1, Math.ceil((b + reach - origin[k]) / step))];
+        return [Math.max(0, Math.floor((a - reach - origin[k]) / step)), Math.min(dims[k] - 1, Math.ceil((b + reach - origin[k]) / step))];
       };
-      const [i0, i1] = range(0), [j0, j1] = range(1), [k0, k1] = range(2);
+      const [i0, i1] = range(0), [j0, j1] = range(1), [k0, k1] = range(2), cx = normal[f * 3], cy = normal[f * 3 + 1], cz = normal[f * 3 + 2], plane = !flat(f);
       for (let k = k0; k <= k1; k++) for (let j = j0; j <= j1; j++) for (let i = i0; i <= i1; i++) {
         const x = origin[0] + i * step, y = origin[1] + j * step, z = origin[2] + k * step;
-        if (area > 0 && Math.abs((x - p[t]) * cx + (y - p[t + 1]) * cy + (z - p[t + 2]) * cz) > reach) continue;
-        const d2 = triangleDistanceSq(x, y, z, p, t), id = i + j * nx + k * nxy;
-        if (d2 > reach * reach) continue;
-        if (thin) { state[id] = 3; continue; }
-        const q = Math.round(Math.sqrt(d2) * qScale);
-        if (q < dist[id]) dist[id] = q;
-      }
-    }
-    const qSeal = Math.floor(seal * qScale), qRadius = Math.floor(radius * qScale);
-    const flood = (seeds, enter, mark) => {
-      let queue = new Int32Array(1 << 20), head = 0, tail = 0, size = 0;
-      const push = (id, seed) => {
-        if (!seed && !enter(id)) return;
-        state[id] = mark;
-        if (size === queue.length) { const grown = new Int32Array(queue.length * 2); for (let i = 0; i < size; i++) grown[i] = queue[(head + i) % queue.length]; queue = grown; head = 0; tail = size; }
-        queue[tail] = id; tail = (tail + 1) % queue.length; size++;
-      };
-      for (const id of seeds) push(id, true);
-      while (size) {
-        const id = queue[head]; head = (head + 1) % queue.length; size--;
-        const i = id % nx, j = (id / nx | 0) % ny, k = id / nxy | 0;
-        if (i > 0) push(id - 1); if (i < nx - 1) push(id + 1);
-        if (j > 0) push(id - nx); if (j < ny - 1) push(id + nx);
-        if (k > 0) push(id - nxy); if (k < nz - 1) push(id + nxy);
+        const s = plane ? (x - p[t]) * cx + (y - p[t + 1]) * cy + (z - p[t + 2]) * cz : 0;
+        if (s > reach || s < -reach) continue;
+        const d2 = triangleDistanceSq(x, y, z, p, t);
+        if (d2 <= reach * reach) visit(i + j * nx + k * nxy, s, d2);
       }
     };
-    // Flood the exterior from a padded corner; nodes within `seal` of any triangle block it.
-    flood([0], id => state[id] === 0 && dist[id] > qSeal, 1);
-    // Closing: grow the exterior back by `seal`. Exterior nodes are farther than `seal` from every
-    // triangle and each layer moves one step, so the growth cannot cross a surface; a sealed opening
-    // keeps a cap, dimpled up to `seal` deep.
-    const exterior = v => v === 1 || v === 2, unsealed = [];
-    for (let layer = 0; layer < Math.floor(seal / step + 1e-9); layer++) {
-      const added = [];
-      for (let k = 1; k < nz - 1; k++) for (let j = 1; j < ny - 1; j++) for (let i = 1; i < nx - 1; i++) {
-        const id = i + j * nx + k * nxy;
-        if (!exterior(state[id]) && (exterior(state[id - 1]) || exterior(state[id + 1]) || exterior(state[id - nx]) || exterior(state[id + nx]) || exterior(state[id - nxy]) || exterior(state[id + nxy]))) added.push(id);
-      }
-      for (const id of added) { state[id] = 2; unsealed.push(id); }
+    for (let f = 0; f < F; f++) nodes(f, band, (id, s, d2) => { const q = Math.round(Math.sqrt(d2) * qScale); if (q < dist[id]) dist[id] = q; });
+    // Node state: 0 enclosed, 1 exterior (flooded from a padded corner through nodes farther than
+    // `seal` from every face), 2 exterior next to a surface.
+    const qSeal = Math.floor(seal * qScale);
+    let queue = new Int32Array(1 << 20), head = 0, tail = 0, size = 0;
+    const push = id => {
+      if (state[id] || dist[id] <= qSeal) return;
+      state[id] = 1;
+      if (size === queue.length) { const grown = new Int32Array(queue.length * 2); for (let i = 0; i < size; i++) grown[i] = queue[(head + i) % queue.length]; queue = grown; head = 0; tail = size; }
+      queue[tail] = id; tail = (tail + 1) % queue.length; size++;
+    };
+    push(0);
+    while (size) {
+      const id = queue[head]; head = (head + 1) % queue.length; size--;
+      const i = id % nx, j = (id / nx | 0) % ny, k = id / nxy | 0;
+      if (i > 0) push(id - 1); if (i < nx - 1) push(id + 1);
+      if (j > 0) push(id - nx); if (j < ny - 1) push(id + nx);
+      if (k > 0) push(id - nxy); if (k < nz - 1) push(id + nxy);
     }
-    // Thin exact shells block the flood but must not grow a grid surface around themselves.
-    flood(unsealed, id => state[id] === 3 && dist[id] > qRadius, 2);
+    queue = null;
+    // Give the exterior back the layer the flood kept clear of: a node joins when a flooded node
+    // lies within `seal` plus a grid diagonal and their two clearances add up to more than their
+    // distance, which cannot hold across a surface. Openings the flood did not pass stay closed.
+    const rho = seal + step * .87, reach = Math.ceil(rho / step), offsets = [];
+    for (let c = -reach; c <= reach; c++) for (let b = -reach; b <= reach; b++) for (let a = -reach; a <= reach; a++) {
+      const length = Math.hypot(a, b, c) * step;
+      if (length > 0 && length <= rho) offsets.push([length, a + b * nx + c * nxy]);
+    }
+    offsets.sort((x, y) => x[0] - y[0]);
+    const jump = Int32Array.from(offsets, o => o[1]), needed = Float64Array.from(offsets, o => o[0] * qScale + 1);
+    for (let k = reach; k < nz - reach; k++) for (let j = reach; j < ny - reach; j++) for (let i = reach, id = reach + j * nx + k * nxy; i < nx - reach; i++, id++) {
+      if (state[id] || dist[id] > qSeal) continue;
+      for (let o = 0; o < jump.length; o++) if (state[id + jump[o]] === 1 && dist[id] + dist[id + jump[o]] > needed[o]) { state[id] = 2; break; }
+    }
     let enclosed = 0;
-    for (let id = 0; id < n; id++) if ((state[id] === 0 || state[id] === 3) && dist[id] === 255) enclosed++;
-    // Positive inside: enclosed nodes, and every node within `radius` of a triangle (sheets become slabs).
-    const field = id => { const d = dist[id] / qScale; return state[id] === 1 || state[id] === 2 ? radius - d : radius + d; };
-    const approx = owned(module.Manifold.levelSet(([x, y, z]) => {
-      const fx = Math.min(Math.max((x - origin[0]) / step, 0), nx - 1.000001), fy = Math.min(Math.max((y - origin[1]) / step, 0), ny - 1.000001), fz = Math.min(Math.max((z - origin[2]) / step, 0), nz - 1.000001);
-      const i = fx | 0, j = fy | 0, k = fz | 0, u = fx - i, v = fy - j, w = fz - k, id = i + j * nx + k * nxy;
-      const c00 = field(id) * (1 - u) + field(id + 1) * u, c10 = field(id + nx) * (1 - u) + field(id + nx + 1) * u;
-      const c01 = field(id + nxy) * (1 - u) + field(id + nxy + 1) * u, c11 = field(id + nxy + nx) * (1 - u) + field(id + nxy + nx + 1) * u;
-      return (c00 * (1 - v) + c10 * v) * (1 - w) + (c01 * (1 - v) + c11 * v) * w;
-    }, { min: origin, max: origin.map((o, k) => o + ([nx, ny, nz][k] - 1) * step) }, step));
-    // Simplify before the union so the exact shells are not re-simplified with the grid surface.
-    let simplification = step / 10, reduced = owned(approx.simplify(simplification));
-    // Each pass works on the previous result; accumulated deviation stays below 3 × the last tolerance.
-    while (reduced.numTri() > MAX_OUTPUT_TRIANGLES && simplification < step) { simplification *= 1.5; reduced = owned(reduced.simplify(simplification)); }
-    const solid = module.Manifold.union([reduced, ...shells]);
-    return { solid, step, radius, seal, sealGap, simplification: simplification * 3, closedShells: shells.length, grid: [nx, ny, nz], enclosedFraction: enclosed / n };
+    for (let id = 0; id < n; id++) if (!state[id] && dist[id] === 255) enclosed++;
+    // Which sides of each remaining face see the exterior: nodes 0.6–1.6 steps off the face vote,
+    // unless another surface is nearer to them than this face.
+    const ext = new Uint8Array(F * 2), votes = [0, 0, 0, 0];
+    for (let f = 0; f < F; f++) {
+      if (flat(f)) continue;
+      votes.fill(0);
+      nodes(f, step * 1.6, (id, s, d2) => {
+        const d = Math.sqrt(d2), side = s > 0 ? 0 : 1;
+        if (Math.abs(s) < step * .6 || d > Math.abs(s) * 1.25 || dist[id] < d * qScale - 1.5) return;
+        votes[side * 2 + (state[id] ? 0 : 1)]++;
+      });
+      for (let side = 0; side < 2; side++) {
+        if (votes[side * 2] + votes[side * 2 + 1]) { ext[f * 2 + side] = votes[side * 2] >= votes[side * 2 + 1] ? 1 : 0; continue; }
+        const t = f * 9, sign = side ? -step : step, at = k => Math.min(dims[k] - 1, Math.max(0, Math.round(((p[t + k] + p[t + 3 + k] + p[t + 6 + k]) / 3 + normal[f * 3 + k] * sign - origin[k]) / step)));
+        ext[f * 2 + side] = state[at(0) + at(1) * nx + at(2) * nxy] ? 1 : 0;
+      }
+    }
+    // 3a. Skin. Each face side looks into the exterior (X), a solid cell (C) or other enclosed
+    // space (R, filled by the core). kind 2: X on both sides, a slab centred on the face.
+    // kind 1: X on one side and, within `depth` behind the face, enclosed space that no cell fills;
+    // extruded inward to meet the core, but never through another surface that faces the exterior.
+    // `out` is the unit normal towards the exterior (as wound for kind 2).
+    const X = 1, C = 2, R = 3, look = h => inCell[h] ? C : ext[h] ? X : R;
+    const kind = new Uint8Array(F), out = new Float64Array(F * 3), deep = new Float64Array(F).fill(depth), solo = new Uint8Array(F), trims = new Map();
+    const geometry = new BufferGeometry().setAttribute('position', new BufferAttribute(Float32Array.from(p), 3));
+    try {
+      const bvh = new MeshBVH(geometry, { maxDepth: 80, verbose: false }), order = geometry.index.array, ray = new Ray(), near = Math.max(1e-3, weldTolerance * 10);
+      for (let f = 0; f < F; f++) {
+        if (flat(f)) continue;
+        const front = look(f * 2), back = look(f * 2 + 1);
+        if (front !== X && back !== X) continue;
+        const sign = front === X ? 1 : -1;
+        for (let k = 0; k < 3; k++) out[f * 3 + k] = normal[f * 3 + k] * sign;
+        if (front === back) { kind[f] = 2; continue; }
+        const t = f * 9, c = [0, 1, 2].map(k => (p[t + k] + p[t + 3 + k] + p[t + 6 + k]) / 3);
+        if ((front === X ? back : front) !== R) continue; // A solid cell is behind it already.
+        kind[f] = 1;
+        ray.direction.set(-out[f * 3], -out[f * 3 + 1], -out[f * 3 + 2]);
+        for (let sample = 0; sample < 4; sample++) {
+          const w = sample < 3 ? .85 : 0, v = t + (sample % 3) * 3;
+          ray.origin.set(c[0] + (p[v] - c[0]) * w, c[1] + (p[v + 1] - c[1]) * w, c[2] + (p[v + 2] - c[2]) * w);
+          for (const hit of bvh.raycast(ray, DoubleSide, near, deep[f]).sort((a, b) => a.distance - b.distance)) {
+            const g = order[hit.faceIndex * 3] / 3 | 0;
+            if (hit.distance >= deep[f]) break;
+            if (g === f || flat(g) || vertex[g * 3] === vertex[f * 3] || vertex[g * 3] === vertex[f * 3 + 1] || vertex[g * 3] === vertex[f * 3 + 2] || vertex[g * 3 + 1] === vertex[f * 3] || vertex[g * 3 + 1] === vertex[f * 3 + 1] || vertex[g * 3 + 1] === vertex[f * 3 + 2] || vertex[g * 3 + 2] === vertex[f * 3] || vertex[g * 3 + 2] === vertex[f * 3 + 1] || vertex[g * 3 + 2] === vertex[f * 3 + 2]) continue;
+            const leaving = normal[g * 3] * ray.direction.x + normal[g * 3 + 1] * ray.direction.y + normal[g * 3 + 2] * ray.direction.z > 0 ? 0 : 1;
+            if (look(g * 2 + leaving) === X) { deep[f] = hit.distance; break; }
+          }
+          // Exterior nodes behind the face mean it is a thin part: give it wall thickness only.
+          for (const reach of [deep[f] / 2, deep[f]]) {
+            const node = k => Math.min(dims[k] - 1, Math.max(0, Math.round((ray.origin.getComponent(k) + ray.direction.getComponent(k) * reach - origin[k]) / step)));
+            if (state[node(0) + node(1) * nx + node(2) * nxy]) deep[f] = Math.min(deep[f], minWall);
+          }
+        }
+      }
+    } finally { geometry.dispose(); }
+    const edges = new Map(), V = first.length;
+    for (let f = 0; f < F; f++) {
+      if (!kind[f]) continue;
+      for (let k = 0; k < 3; k++) {
+        const a = vertex[f * 3 + k], b = vertex[f * 3 + (k + 1) % 3], key = a < b ? a * V + b : b * V + a;
+        let list = edges.get(key);
+        if (!list) edges.set(key, list = []);
+        list.push(f * 3 + k);
+      }
+    }
+    // 3b. Core: fills enclosed space on a grid twice as coarse. It is built from nodes with no
+    // exterior node within two steps on any axis, so it stays behind every face and the
+    // extrusions hide it; it is only visible where it closes an opening the flood did not pass.
+    let coreSolid = null;
+    if (enclosed) {
+      const deepNode = dist; // The distances are no longer needed.
+      for (let id = 0; id < n; id++) deepNode[id] = state[id] ? 0 : 1;
+      for (let pass = 0; pass < 2; pass++) for (const stride of [1, nx, nxy]) {
+        for (let id = 0; id < n; id++) state[id] = deepNode[id] && id >= stride && id + stride < n && deepNode[id - stride] && deepNode[id + stride] ? 1 : 0;
+        deepNode.set(state);
+      }
+      const even = dims.map(d => d - 1 - (d - 1) % 2);
+      // Samples fall on grid nodes; averaging the 27 surrounding nodes gives flat faces a linear ramp.
+      const core = owned(module.Manifold.levelSet(([x, y, z]) => {
+        const i = Math.round((x - origin[0]) / step), j = Math.round((y - origin[1]) / step), k = Math.round((z - origin[2]) / step);
+        if (i < 1 || j < 1 || k < 1 || i > nx - 2 || j > ny - 2 || k > nz - 2) return -.5;
+        let sum = 0;
+        for (let id = i - 1 + (j - 1) * nx + (k - 1) * nxy, c = 0; c < 3; c++, id += nxy) for (let b = 0; b < 3; b++) { const row = id + b * nx; sum += deepNode[row] + deepNode[row + 1] + deepNode[row + 2]; }
+        return sum / 27 - .5;
+      }, { min: origin, max: origin.map((o, k) => o + even[k] * step) }, step * 2));
+      coreSolid = owned(core.simplify(step / 4));
+    }
+    const dot = (f, g) => out[f * 3] * out[g * 3] + out[f * 3 + 1] * out[g * 3 + 1] + out[f * 3 + 2] * out[g * 3 + 2];
+    // Signed height of face g's vertex opposite corner slot `gk` above face f's plane.
+    const above = (f, g, gk) => { const w = g * 9 + (gk + 2) % 3 * 3, t = f * 9; return (p[w] - p[t]) * out[f * 3] + (p[w + 1] - p[t + 1]) * out[f * 3 + 1] + (p[w + 2] - p[t + 2]) * out[f * 3 + 2]; };
+    // Along a sharp ridge each extrusion would pierce the other face: extrude those faces on their own and trim them.
+    const eps = Math.max(1e-6, weldTolerance);
+    for (const list of edges.values()) {
+      if (list.length !== 2) continue;
+      const f = list[0] / 3 | 0, g = list[1] / 3 | 0;
+      if (kind[f] !== 1 || kind[g] !== 1 || !(above(f, g, list[1] % 3) < -eps && above(g, f, list[0] % 3) < -eps && dot(f, g) < -.01)) continue;
+      solo[f] = solo[g] = 1;
+      if (!trims.has(f)) trims.set(f, []); if (!trims.has(g)) trims.set(g, []);
+      trims.get(f).push(g); trims.get(g).push(f);
+    }
+    // Coplanar neighbours of the same kind and depth share one extrusion.
+    const patch = Int32Array.from({ length: F }, (_, i) => i), root = x => { while (patch[x] !== x) x = patch[x] = patch[patch[x]]; return x; };
+    for (const list of edges.values()) for (let i = 1; i < list.length; i++) {
+      const f = list[0] / 3 | 0, g = list[i] / 3 | 0;
+      if (kind[f] === kind[g] && !solo[f] && !solo[g] && Math.abs(deep[f] - deep[g]) < 1e-4 && dot(f, g) > 1 - 1e-6) patch[root(g)] = root(f);
+    }
+    const patches = new Map();
+    for (let f = 0; f < F; f++) if (kind[f]) { const r = root(f); if (!patches.has(r)) patches.set(r, []); patches.get(r).push(f); }
+    const extrude = faces => {
+      const f0 = faces[0], top = kind[f0] === 2 ? minWall / 2 : 0, bottom = kind[f0] === 2 ? -minWall / 2 : -deep[f0];
+      const local = new Map(), props = [], tris = [], half = new Set();
+      for (const f of faces) {
+        const v = [0, 1, 2].map(k => {
+          const id = vertex[f * 3 + k];
+          if (!local.has(id)) { local.set(id, local.size); props.push(p[first[id]], p[first[id] + 1], p[first[id] + 2]); }
+          return local.get(id);
+        });
+        if (out[f * 3] * normal[f * 3] + out[f * 3 + 1] * normal[f * 3 + 1] + out[f * 3 + 2] * normal[f * 3 + 2] < 0) [v[1], v[2]] = [v[2], v[1]]; // Wind the top face towards `out`.
+        tris.push(v);
+        for (let k = 0; k < 3; k++) half.add(v[k] * 4294967296 + v[(k + 1) % 3]);
+      }
+      const count = local.size, o = [out[f0 * 3], out[f0 * 3 + 1], out[f0 * 3 + 2]], vertProperties = new Float32Array(count * 6), triVerts = [];
+      for (let i = 0; i < count; i++) for (let k = 0; k < 3; k++) { vertProperties[i * 3 + k] = props[i * 3 + k] + o[k] * top; vertProperties[(count + i) * 3 + k] = props[i * 3 + k] + o[k] * bottom; }
+      for (const [a, b, c] of tris) {
+        triVerts.push(a, b, c, count + a, count + c, count + b);
+        for (const [u, v] of [[a, b], [b, c], [c, a]]) if (!half.has(v * 4294967296 + u)) triVerts.push(v, u, count + u, v, count + u, count + v);
+      }
+      return owned(new module.Manifold(new module.Mesh({ numProp: 3, vertProperties, triVerts: Uint32Array.from(triVerts) })));
+    };
+    let skinFaces = 0, extrusions = 0;
+    for (const faces of patches.values()) {
+      skinFaces += faces.length;
+      let made;
+      try { made = [extrude(faces)]; if (!(made[0].volume() > 0)) throw Object.assign(new Error(), { code: 'NotManifold' }); }
+      catch (error) {
+        if (error.code !== 'NotManifold') throw error;
+        made = [];
+        if (faces.length > 1) for (const f of faces) try { made.push(extrude([f])); } catch (inner) { if (inner.code !== 'NotManifold') throw inner; }
+      }
+      if (faces.length === 1) for (const g of trims.get(faces[0]) ?? []) {
+        const t = g * 9;
+        made = made.map(m => owned(m.trimByPlane([-out[g * 3], -out[g * 3 + 1], -out[g * 3 + 2]], -(p[t] * out[g * 3] + p[t + 1] * out[g * 3 + 1] + p[t + 2] * out[g * 3 + 2]))));
+      }
+      for (const m of made) if (!m.isEmpty()) { solids.push(m); extrusions++; }
+    }
+    if (!solids.length) throw failure('沒有可重建的表面。');
+    if (coreSolid) solids.push(coreSolid);
+    const merged = unionNearby(module, solids, owned);
+    const outer = fillVoids(module, merged), filled = outer ? owned(outer) : merged;
+    // Booleans leave many slivers on flat faces; loosen the tolerance only as far as needed.
+    let simplification = Math.max(weldTolerance, 1e-3), simple = owned(filled.simplify(simplification));
+    while (simple.numTri() > MAX_OUTPUT_TRIANGLES && simplification < step / 4) { simplification = Math.min(step / 4, simplification * 2.5); simple = owned(simple.simplify(simplification)); }
+    const solid = fillVoids(module, simple) ?? simple.translate([0, 0, 0]); // Simplifying can invert specks.
+    return { solid, step, seal, sealGap, depth, simplification, cells, skinFaces, extrusions, grid: dims, enclosedFraction: enclosed / n };
   } finally { keep.forEach(m => m.delete()); }
 }
