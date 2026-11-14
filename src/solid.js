@@ -41,7 +41,8 @@ export function processModel(module, input, config) {
         if (!config.reconstruct) throw new Error(`${error.message} 可啟用「近似重建破碎表面」重試；細節與尺寸會改變。`);
         const rebuilt = reconstructMesh(module, failed, config);
         solids.push(keep(rebuilt.solid));
-        meshRepair = { reconstructed: true, repairedParts: failed.length, step: rebuilt.step, radius: rebuilt.radius, simplification: rebuilt.simplification, reason: error.message };
+        const { solid: _, ...details } = rebuilt;
+        meshRepair = { reconstructed: true, repairedParts: failed.length, ...details, reason: error.message };
       }
     }
     solid = keep(module.Manifold.union(solids));

@@ -234,8 +234,33 @@ test('approximate reconstruction is opt-in, closes branched sheets and survives 
   assert.ok(Math.abs(reimported.volume - r.volume) < r.volume * 1e-5);
 });
 
+test('reconstruction fills cracked, partly inverted shells and keeps sub-grid closed shells exact', () => {
+  const cube = box(20, 20, 20);
+  for (let i = 37; i < 54; i += 3) cube[i] += .3; // Lift the top face: a 0.3 mm crack on every top edge.
+  cube.set(cube.slice(60, 63), 57); cube.set(box(20, 20, 20).slice(57, 60), 60); // Reverse one side triangle.
+  const soup = Float32Array.from([...cube, ...box(.2, .2, .2, 15, 20.5, 0)]); // One STL part, as SketchUp exports.
+  assert.throws(() => run([soup], { maxHoleSize: 0 }), /近似重建/);
+  const r = run([soup], { maxHoleSize: 0, reconstruct: true });
+  assert.equal(r.meshRepair.reconstructed, true);
+  assert.equal(r.meshRepair.closedShells, 1);
+  assert.ok(r.meshRepair.enclosedFraction > 0);
+  const outer = 20 + 2 * r.meshRepair.step;
+  assert.ok(r.volume > 20 ** 3 * .95 && r.volume < outer ** 3 + 1, `volume ${r.volume}`); // Solid, not a hollow skin.
+  const b = bounds([r.positions]);
+  assert.ok(Math.abs(b.max.x - 12.55) < 1e-4, `max x ${b.max.x}`); // Centered tiny box face, not inflated by the grid.
+});
+test('reconstruction seal width decides whether a wide opening stays hollow', () => {
+  const cube = box(20, 20, 20);
+  for (let i = 37; i < 54; i += 3) cube[i] += 1.5; // 1.5 mm gap under the whole roof.
+  const open = run([cube], { maxHoleSize: 0, reconstruct: true });
+  const sealed = run([cube], { maxHoleSize: 0, reconstruct: true, sealGap: 4 });
+  assert.ok(open.volume < 20 ** 3 * .5, `open ${open.volume}`);
+  assert.ok(sealed.volume > 20 ** 3 * .95, `sealed ${sealed.volume}`);
+  assert.equal(sealed.meshRepair.sealGap, 4);
+  assert.throws(() => run([cube], { maxHoleSize: 0, reconstruct: true, sealGap: -1 }), /封閉開口/);
+});
 
-const realSTL = new URL('../test.stl', import.meta.url);
+const realSTL = [new URL('../test.stl', import.meta.url), new URL('../test_modes/test.stl', import.meta.url)].find(existsSync) ?? new URL('../test.stl', import.meta.url);
 test('local test.stl imports, reconstructs and reimports without repair', { skip: !existsSync(realSTL) }, () => {
   const bytes = readFileSync(realSTL);
   const parts = parseModel(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength), 'stl');

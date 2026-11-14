@@ -154,27 +154,178 @@ export function repairMesh(parts, { weldTolerance = .001, maxHoleSize = 50 } = {
   return { vertProperties: new Float32Array(properties), triVerts: new Uint32Array(indices), stats };
 }
 
-// Approximate rescue for branched/open surfaces: thicken the surface distance field.
-// ponytail: at most 160 samples across the longest axis; finer detail needs adaptive meshing.
-export function reconstructMesh(module, parts, { minWall = .8 } = {}) {
+const MAX_NODES = 24_000_000, MAX_OUTPUT_TRIANGLES = 400_000;
+
+// Squared distance from p to triangle abc (Ericson, Real-Time Collision Detection 5.1.5).
+function triangleDistanceSq(px, py, pz, t, o) {
+  const ax = t[o], ay = t[o + 1], az = t[o + 2];
+  const abx = t[o + 3] - ax, aby = t[o + 4] - ay, abz = t[o + 5] - az, acx = t[o + 6] - ax, acy = t[o + 7] - ay, acz = t[o + 8] - az;
+  const apx = px - ax, apy = py - ay, apz = pz - az;
+  const d1 = abx * apx + aby * apy + abz * apz, d2 = acx * apx + acy * apy + acz * apz;
+  let u, v; // p = a + u·ab + v·ac
+  if (d1 <= 0 && d2 <= 0) { u = 0; v = 0; }
+  else {
+    const bpx = apx - abx, bpy = apy - aby, bpz = apz - abz, d3 = abx * bpx + aby * bpy + abz * bpz, d4 = acx * bpx + acy * bpy + acz * bpz;
+    const cpx = apx - acx, cpy = apy - acy, cpz = apz - acz, d5 = abx * cpx + aby * cpy + abz * cpz, d6 = acx * cpx + acy * cpy + acz * cpz;
+    const vc = d1 * d4 - d3 * d2, vb = d5 * d2 - d1 * d6, va = d3 * d6 - d5 * d4;
+    if (d3 >= 0 && d4 <= d3) { u = 1; v = 0; }
+    else if (d6 >= 0 && d5 <= d6) { u = 0; v = 1; }
+    else if (vc <= 0 && d1 >= 0 && d3 <= 0) { u = d1 / (d1 - d3); v = 0; }
+    else if (vb <= 0 && d2 >= 0 && d6 <= 0) { u = 0; v = d2 / (d2 - d6); }
+    else if (va <= 0 && d4 - d3 >= 0 && d5 - d6 >= 0) { v = (d4 - d3) / ((d4 - d3) + (d5 - d6)); u = 1 - v; }
+    else { const sum = va + vb + vc; if (!sum) { u = 0; v = 0; } else { u = vb / sum; v = vc / sum; } }
+  }
+  const dx = apx - u * abx - v * acx, dy = apy - u * aby - v * acy, dz = apz - u * abz - v * acz;
+  return dx * dx + dy * dy + dz * dz;
+}
+
+// Closed, consistently oriented shells thinner than `thinBelow` (mullions, railings, panes) are
+// below grid resolution; they are kept exactly instead of being blurred by the distance field.
+function thinClosedShells(module, p, weldTolerance, thinBelow, keep) {
+  const ids = new Map(), vertex = new Int32Array(p.length / 3);
+  for (let i = 0; i < vertex.length; i++) {
+    const key = `${Math.round(p[i * 3] / weldTolerance)},${Math.round(p[i * 3 + 1] / weldTolerance)},${Math.round(p[i * 3 + 2] / weldTolerance)}`;
+    if (!ids.has(key)) ids.set(key, ids.size);
+    vertex[i] = ids.get(key);
+  }
+  const parent = Int32Array.from({ length: ids.size }, (_, i) => i);
+  const find = x => { while (parent[x] !== x) x = parent[x] = parent[parent[x]]; return x; };
+  for (let i = 0; i < vertex.length; i += 3) { parent[find(vertex[i + 1])] = find(vertex[i]); parent[find(vertex[i + 2])] = find(vertex[i]); }
+  const groups = new Map();
+  for (let f = 0; f < vertex.length / 3; f++) {
+    const root = find(vertex[f * 3]);
+    if (!groups.has(root)) groups.set(root, []);
+    groups.get(root).push(f);
+  }
+  const shells = [], thinFace = new Uint8Array(vertex.length / 3);
+  for (const faces of groups.values()) {
+    const lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
+    for (const f of faces) for (let i = f * 9; i < f * 9 + 9; i++) { const k = i % 3; lo[k] = Math.min(lo[k], p[i]); hi[k] = Math.max(hi[k], p[i]); }
+    if (Math.min(...hi.map((h, k) => h - lo[k])) >= thinBelow) continue;
+    const half = new Set(); let closed = true;
+    for (const f of faces) for (let k = 0; k < 3 && closed; k++) {
+      const a = vertex[f * 3 + k], b = vertex[f * 3 + (k + 1) % 3], key = `${a},${b}`;
+      if (a === b || half.has(key)) closed = false; else half.add(key);
+    }
+    if (!closed) continue;
+    for (const key of half) { const [a, b] = key.split(','); if (!half.has(`${b},${a}`)) { closed = false; break; } }
+    if (!closed) continue;
+    const triVerts = new Uint32Array(faces.length * 3), local = new Map(), props = [];
+    faces.forEach((f, i) => { for (let k = 0; k < 3; k++) {
+      const v = vertex[f * 3 + k];
+      if (!local.has(v)) { local.set(v, local.size); props.push(p[f * 9 + k * 3], p[f * 9 + k * 3 + 1], p[f * 9 + k * 3 + 2]); }
+      triVerts[i * 3 + k] = local.get(v);
+    } });
+    let m;
+    try { m = keep(new module.Manifold(new module.Mesh({ numProp: 3, vertProperties: new Float32Array(props), triVerts }))); }
+    catch (error) { if (error.code === 'NotManifold') continue; throw error; }
+    if (m.volume() < 0) { // Inverted shell: reverse winding.
+      for (let i = 0; i < triVerts.length; i += 3) [triVerts[i + 1], triVerts[i + 2]] = [triVerts[i + 2], triVerts[i + 1]];
+      m = keep(new module.Manifold(new module.Mesh({ numProp: 3, vertProperties: new Float32Array(props), triVerts })));
+    }
+    if (!(m.volume() > 0)) continue;
+    shells.push(m);
+    for (const f of faces) thinFace[f] = 1;
+  }
+  return { shells, thinFace };
+}
+
+// Approximate rescue for SketchUp-style triangle soups (open seams, branched edges, inverted or
+// zero-thickness faces). Inside/outside comes from flood-filling the exterior on a grid, so face
+// orientation and topology are ignored; the distance to the nearest triangle gives the surface
+// sub-grid position. Openings narrower than `sealGap` (at least about two grid steps) are closed
+// morphologically; wider ones let the exterior in and those spaces stay hollow.
+export function reconstructMesh(module, parts, { minWall = .8, weldTolerance = .001, sealGap = 0 } = {}) {
   if (!Number.isFinite(minWall) || minWall < .1 || minWall > 20) throw failure('壁厚需介於 0.1–20 mm。');
-  const p = new Float32Array(parts.reduce((n, part) => n + part.length, 0));
+  if (!Number.isFinite(sealGap) || sealGap < 0 || sealGap > 20) throw new RangeError('封閉開口寬度需為 0–20 mm。');
+  const p = new Float64Array(parts.reduce((n, part) => n + part.length, 0));
   let offset = 0;
   for (const part of parts) { p.set(part, offset); offset += part.length; }
-  const geometry = new BufferGeometry().setAttribute('position', new BufferAttribute(p, 3));
+  const lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
+  for (let i = 0; i < p.length; i++) { const k = i % 3; if (p[i] < lo[k]) lo[k] = p[i]; if (p[i] > hi[k]) hi[k] = p[i]; }
+  // Distances are tracked within `band`; two extra nodes of padding keep the grid border exterior.
+  const bandFor = h => Math.max(h * 2, Math.max(h, sealGap / 2) + h), padFor = h => Math.ceil(bandFor(h) / h) + 2;
+  const dimsFor = h => lo.map((l, k) => Math.ceil((hi[k] - l) / h) + 1 + padFor(h) * 2);
+  let step = minWall / 2;
+  while (dimsFor(step).reduce((a, b) => a * b) > MAX_NODES) step *= 1.05;
+  const radius = step * .75, seal = Math.max(step, sealGap / 2), band = bandFor(step);
+  const [nx, ny, nz] = dimsFor(step), nxy = nx * ny, n = nxy * nz, origin = lo.map(l => l - step * padFor(step));
+  const keep = [], owned = m => { keep.push(m); return m; };
   try {
-    geometry.computeBoundingBox();
-    const box = geometry.boundingBox.clone(), size = box.getSize(new Vector3());
-    const step = Math.max(minWall / 2, Math.max(size.x, size.y, size.z) / 160);
-    const radius = step;
-    box.expandByScalar(radius + step * 2);
-    const bvh = new MeshBVH(geometry), point = new Vector3(), target = {};
-    const solid = module.Manifold.levelSet(x => {
-      point.fromArray(x);
-      const hit = bvh.closestPointToPoint(point, target, 0, radius + step);
-      return radius - (hit ? hit.distance : radius + step);
-    }, { min: box.min.toArray(), max: box.max.toArray() }, step);
-    try { return { solid: solid.simplify(step / 10), step, radius, simplification: step / 10 }; }
-    finally { solid.delete(); }
-  } finally { geometry.dispose(); }
+    const { shells, thinFace } = thinClosedShells(module, p, weldTolerance, step * 2, owned);
+    // Unsigned distance within the band, quantized to 254 levels; 255 = farther than the band.
+    // Node state: 0 unknown, 1 exterior, 2 exterior after un-sealing, 3 blocked by a thin exact shell.
+    const dist = new Uint8Array(n).fill(255), qScale = 254 / band, state = new Uint8Array(n);
+    for (let t = 0; t < p.length; t += 9) {
+      const thin = thinFace[t / 9], reach = thin ? seal : band;
+      const ex1 = p[t + 3] - p[t], ey1 = p[t + 4] - p[t + 1], ez1 = p[t + 5] - p[t + 2], ex2 = p[t + 6] - p[t], ey2 = p[t + 7] - p[t + 1], ez2 = p[t + 8] - p[t + 2];
+      let cx = ey1 * ez2 - ez1 * ey2, cy = ez1 * ex2 - ex1 * ez2, cz = ex1 * ey2 - ey1 * ex2;
+      const area = Math.hypot(cx, cy, cz); if (area > 0) { cx /= area; cy /= area; cz /= area; }
+      const range = k => {
+        const a = Math.min(p[t + k], p[t + 3 + k], p[t + 6 + k]), b = Math.max(p[t + k], p[t + 3 + k], p[t + 6 + k]);
+        return [Math.max(0, Math.floor((a - reach - origin[k]) / step)), Math.min([nx, ny, nz][k] - 1, Math.ceil((b + reach - origin[k]) / step))];
+      };
+      const [i0, i1] = range(0), [j0, j1] = range(1), [k0, k1] = range(2);
+      for (let k = k0; k <= k1; k++) for (let j = j0; j <= j1; j++) for (let i = i0; i <= i1; i++) {
+        const x = origin[0] + i * step, y = origin[1] + j * step, z = origin[2] + k * step;
+        if (area > 0 && Math.abs((x - p[t]) * cx + (y - p[t + 1]) * cy + (z - p[t + 2]) * cz) > reach) continue;
+        const d2 = triangleDistanceSq(x, y, z, p, t), id = i + j * nx + k * nxy;
+        if (d2 > reach * reach) continue;
+        if (thin) { state[id] = 3; continue; }
+        const q = Math.round(Math.sqrt(d2) * qScale);
+        if (q < dist[id]) dist[id] = q;
+      }
+    }
+    const qSeal = Math.floor(seal * qScale), qRadius = Math.floor(radius * qScale);
+    const flood = (seeds, enter, mark) => {
+      let queue = new Int32Array(1 << 20), head = 0, tail = 0, size = 0;
+      const push = (id, seed) => {
+        if (!seed && !enter(id)) return;
+        state[id] = mark;
+        if (size === queue.length) { const grown = new Int32Array(queue.length * 2); for (let i = 0; i < size; i++) grown[i] = queue[(head + i) % queue.length]; queue = grown; head = 0; tail = size; }
+        queue[tail] = id; tail = (tail + 1) % queue.length; size++;
+      };
+      for (const id of seeds) push(id, true);
+      while (size) {
+        const id = queue[head]; head = (head + 1) % queue.length; size--;
+        const i = id % nx, j = (id / nx | 0) % ny, k = id / nxy | 0;
+        if (i > 0) push(id - 1); if (i < nx - 1) push(id + 1);
+        if (j > 0) push(id - nx); if (j < ny - 1) push(id + nx);
+        if (k > 0) push(id - nxy); if (k < nz - 1) push(id + nxy);
+      }
+    };
+    // Flood the exterior from a padded corner; nodes within `seal` of any triangle block it.
+    flood([0], id => state[id] === 0 && dist[id] > qSeal, 1);
+    // Closing: grow the exterior back by `seal`. Exterior nodes are farther than `seal` from every
+    // triangle and each layer moves one step, so the growth cannot cross a surface; a sealed opening
+    // keeps a cap, dimpled up to `seal` deep.
+    const exterior = v => v === 1 || v === 2, unsealed = [];
+    for (let layer = 0; layer < Math.floor(seal / step + 1e-9); layer++) {
+      const added = [];
+      for (let k = 1; k < nz - 1; k++) for (let j = 1; j < ny - 1; j++) for (let i = 1; i < nx - 1; i++) {
+        const id = i + j * nx + k * nxy;
+        if (!exterior(state[id]) && (exterior(state[id - 1]) || exterior(state[id + 1]) || exterior(state[id - nx]) || exterior(state[id + nx]) || exterior(state[id - nxy]) || exterior(state[id + nxy]))) added.push(id);
+      }
+      for (const id of added) { state[id] = 2; unsealed.push(id); }
+    }
+    // Thin exact shells block the flood but must not grow a grid surface around themselves.
+    flood(unsealed, id => state[id] === 3 && dist[id] > qRadius, 2);
+    let enclosed = 0;
+    for (let id = 0; id < n; id++) if ((state[id] === 0 || state[id] === 3) && dist[id] === 255) enclosed++;
+    // Positive inside: enclosed nodes, and every node within `radius` of a triangle (sheets become slabs).
+    const field = id => { const d = dist[id] / qScale; return state[id] === 1 || state[id] === 2 ? radius - d : radius + d; };
+    const approx = owned(module.Manifold.levelSet(([x, y, z]) => {
+      const fx = Math.min(Math.max((x - origin[0]) / step, 0), nx - 1.000001), fy = Math.min(Math.max((y - origin[1]) / step, 0), ny - 1.000001), fz = Math.min(Math.max((z - origin[2]) / step, 0), nz - 1.000001);
+      const i = fx | 0, j = fy | 0, k = fz | 0, u = fx - i, v = fy - j, w = fz - k, id = i + j * nx + k * nxy;
+      const c00 = field(id) * (1 - u) + field(id + 1) * u, c10 = field(id + nx) * (1 - u) + field(id + nx + 1) * u;
+      const c01 = field(id + nxy) * (1 - u) + field(id + nxy + 1) * u, c11 = field(id + nxy + nx) * (1 - u) + field(id + nxy + nx + 1) * u;
+      return (c00 * (1 - v) + c10 * v) * (1 - w) + (c01 * (1 - v) + c11 * v) * w;
+    }, { min: origin, max: origin.map((o, k) => o + ([nx, ny, nz][k] - 1) * step) }, step));
+    // Simplify before the union so the exact shells are not re-simplified with the grid surface.
+    let simplification = step / 10, reduced = owned(approx.simplify(simplification));
+    // Each pass works on the previous result; accumulated deviation stays below 3 × the last tolerance.
+    while (reduced.numTri() > MAX_OUTPUT_TRIANGLES && simplification < step) { simplification *= 1.5; reduced = owned(reduced.simplify(simplification)); }
+    const solid = module.Manifold.union([reduced, ...shells]);
+    return { solid, step, radius, seal, sealGap, simplification: simplification * 3, closedShells: shells.length, grid: [nx, ny, nz], enclosedFraction: enclosed / n };
+  } finally { keep.forEach(m => m.delete()); }
 }
